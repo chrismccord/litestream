@@ -23,7 +23,13 @@ PRAGMA litestream_socket = '/var/run/litestream.sock';
 
 The socket path defaults to the `LITESTREAM_SOCKET` environment variable, falling back to `/var/run/litestream.sock`.
 
-3. Enable synchronous replication per-transaction:
+3. Ensure `synchronous=FULL` is set (required for WAL mode — the default `NORMAL` only fsyncs during checkpoints, so xSync would never fire on commits):
+
+```sql
+PRAGMA synchronous=FULL;
+```
+
+4. Enable synchronous replication per-transaction:
 
 ```sql
 PRAGMA litestream_sync = 1;

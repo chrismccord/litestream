@@ -39,13 +39,18 @@ SQLITE_EXTENSION_INIT1
 ** but the xSync we need to intercept fires on the WAL file — a different
 ** LitestreamFile instance. This table lets both handles share state by
 ** database path.
+**
+** syncCounter is an integer counter (not a boolean) so that multiple
+** concurrent connections can each request synchronous replication without
+** stealing each other's flag. Each PRAGMA litestream_sync=1 increments
+** the counter; each WAL xSync that triggers replication decrements it.
 */
 #define LS_MAX_DBS 32
 
 typedef struct LitestreamDBState {
     char *dbPath;           /* canonical database path (owned) */
     char *socketPath;       /* per-db socket override (owned, may be NULL) */
-    int syncOnCommit;       /* 1 = next WAL sync triggers replication */
+    int syncCounter;        /* >0 = pending WAL syncs that need replication */
 } LitestreamDBState;
 
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -76,17 +81,17 @@ static LitestreamDBState *findOrCreateDBStateLocked(const char *dbPath) {
 
     g_dbs[g_dbCount].dbPath = sqlite3_mprintf("%s", dbPath);
     g_dbs[g_dbCount].socketPath = NULL;
-    g_dbs[g_dbCount].syncOnCommit = 0;
+    g_dbs[g_dbCount].syncCounter = 0;
     return &g_dbs[g_dbCount++];
 }
 
-static int getSyncFlag(const char *dbPath) {
+static int getSyncCounter(const char *dbPath) {
     int val = 0;
     int i;
     pthread_mutex_lock(&g_mu);
     for (i = 0; i < g_dbCount; i++) {
         if (strcmp(g_dbs[i].dbPath, dbPath) == 0) {
-            val = g_dbs[i].syncOnCommit;
+            val = g_dbs[i].syncCounter;
             break;
         }
     }
@@ -94,11 +99,23 @@ static int getSyncFlag(const char *dbPath) {
     return val;
 }
 
-static void setSyncFlag(const char *dbPath, int val) {
+static void incSyncCounter(const char *dbPath) {
     LitestreamDBState *st;
     pthread_mutex_lock(&g_mu);
     st = findOrCreateDBStateLocked(dbPath);
-    if (st) st->syncOnCommit = val;
+    if (st) st->syncCounter++;
+    pthread_mutex_unlock(&g_mu);
+}
+
+static void decSyncCounter(const char *dbPath) {
+    int i;
+    pthread_mutex_lock(&g_mu);
+    for (i = 0; i < g_dbCount; i++) {
+        if (strcmp(g_dbs[i].dbPath, dbPath) == 0) {
+            if (g_dbs[i].syncCounter > 0) g_dbs[i].syncCounter--;
+            break;
+        }
+    }
     pthread_mutex_unlock(&g_mu);
 }
 
@@ -440,8 +457,8 @@ static int lsSync(sqlite3_file *pFile, int flags) {
     int rc;
     const char *sock;
 
-    /* Pass through for non-WAL files or when sync not requested */
-    if (!p->isWAL || !p->dbPath || !getSyncFlag(p->dbPath)) {
+    /* Pass through for non-WAL files or when no sync is pending */
+    if (!p->isWAL || !p->dbPath || getSyncCounter(p->dbPath) <= 0) {
         return p->pReal->pMethods->xSync(p->pReal, flags);
     }
 
@@ -451,15 +468,15 @@ static int lsSync(sqlite3_file *pFile, int flags) {
     /* 1. POST to litestream socket: /sync-replicate */
     if (ipc_sync_replicate(sock, p->dbPath) != 0) {
         /* S3 upload failed — return error so SQLite rolls back */
-        setSyncFlag(p->dbPath, 0);
+        decSyncCounter(p->dbPath);
         return SQLITE_IOERR;
     }
 
     /* 2. S3 succeeded, now do local fsync */
     rc = p->pReal->pMethods->xSync(p->pReal, flags);
 
-    /* 3. Auto-reset the flag */
-    setSyncFlag(p->dbPath, 0);
+    /* 3. Consume one pending sync request */
+    decSyncCounter(p->dbPath);
 
     return rc;
 }
@@ -493,12 +510,15 @@ static int lsFileControl(sqlite3_file *pFile, int op, void *pArg) {
 
         if (azArg[1] && strcmp(azArg[1], "litestream_sync") == 0) {
             if (azArg[2] == NULL) {
-                /* Read: return current value from shared state */
-                azArg[0] = sqlite3_mprintf("%d", getSyncFlag(p->dbPath));
+                /* Read: return current counter value */
+                azArg[0] = sqlite3_mprintf("%d", getSyncCounter(p->dbPath));
                 return SQLITE_OK;
             }
-            /* Write: set flag in shared state */
-            setSyncFlag(p->dbPath, atoi(azArg[2]));
+            /* Write: increment counter if setting to 1 (request sync) */
+            if (atoi(azArg[2]) > 0) {
+                incSyncCounter(p->dbPath);
+            }
+            azArg[0] = sqlite3_mprintf("%d", getSyncCounter(p->dbPath));
             return SQLITE_OK;
         }
 
@@ -511,6 +531,7 @@ static int lsFileControl(sqlite3_file *pFile, int op, void *pArg) {
             }
             /* Write: set socket path in shared state */
             setSocketPath(p->dbPath, azArg[2]);
+            azArg[0] = sqlite3_mprintf("ok");
             return SQLITE_OK;
         }
     }
@@ -565,7 +586,7 @@ static int lsUnfetch(sqlite3_file *pFile, sqlite3_int64 iOfst, void *pBuf) {
 #ifdef _WIN32
 __declspec(dllexport)
 #endif
-int sqlite3_litestreamSync_init(
+int sqlite3_litestreamsync_init(
     sqlite3 *db,
     char **pzErrMsg,
     const sqlite3_api_routines *pApi
@@ -617,5 +638,15 @@ int sqlite3_litestreamSync_init(
     ** syncOnCommit is 0, so there is no overhead for normal operations.
     ** Being default means all new connections automatically use the shim
     ** without requiring URI parameters or special connection setup. */
-    return sqlite3_vfs_register(&lsVfs, 1);
+    if (sqlite3_vfs_register(&lsVfs, 1) != SQLITE_OK) {
+        if (pzErrMsg) {
+            *pzErrMsg = sqlite3_mprintf("failed to register litestream VFS");
+        }
+        return SQLITE_ERROR;
+    }
+
+    /* SQLITE_OK_LOAD_PERMANENTLY tells SQLite not to dlclose() this
+    ** extension when the loading connection closes. The VFS must persist
+    ** for the lifetime of the process since future connections use it. */
+    return SQLITE_OK_LOAD_PERMANENTLY;
 }
