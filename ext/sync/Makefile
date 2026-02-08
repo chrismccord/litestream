@@ -1,6 +1,6 @@
 SQLITE_SRC = ../../src
 
-CFLAGS = -shared -fPIC -I$(SQLITE_SRC) -Wall -Wextra -O2
+CFLAGS = -shared -fPIC -I$(SQLITE_SRC) -Wall -Wextra -O2 -pthread
 TARGET = litestream_sync.so
 SRC = litestream_sync.c
 

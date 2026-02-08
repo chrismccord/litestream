@@ -36,7 +36,7 @@ The `litestream_sync` flag auto-resets to 0 after each commit/rollback, so only 
 
 ## How It Works
 
-The extension registers a VFS wrapper ("litestream") that intercepts the WAL file's `xSync` call. When `litestream_sync = 1`, the intercepted `xSync`:
+The extension registers a VFS wrapper ("litestream") as the **default VFS**. It is a transparent passthrough for all operations — zero overhead when `litestream_sync` is not set. When `litestream_sync = 1`, the intercepted WAL `xSync`:
 
 1. POSTs to the litestream sidecar's `/sync-replicate` endpoint over the Unix socket
 2. Litestream reads new WAL frames and uploads LTX files to S3

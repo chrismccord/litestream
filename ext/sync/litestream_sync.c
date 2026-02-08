@@ -9,6 +9,12 @@
 ** If replication fails, SQLITE_IOERR is returned and SQLite rolls back
 ** the transaction.
 **
+** Architecture note: SQLite dispatches PRAGMA xFileControl to the main
+** database file handle, but xSync is called on the WAL file handle.
+** These are separate LitestreamFile instances, so we use a global
+** per-database state table (keyed by db path) to share the sync flag
+** and socket path between them.
+**
 ** Usage:
 **   .load ./litestream_sync
 **   PRAGMA litestream_socket = '/var/run/litestream.sock';  -- optional
@@ -22,28 +28,116 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <pthread.h>
 
 #include "sqlite3ext.h"
 SQLITE_EXTENSION_INIT1
 
+/* ---- Per-database shared state ---- */
+/*
+** PRAGMA litestream_sync is dispatched to the main db file's xFileControl,
+** but the xSync we need to intercept fires on the WAL file — a different
+** LitestreamFile instance. This table lets both handles share state by
+** database path.
+*/
+#define LS_MAX_DBS 32
+
+typedef struct LitestreamDBState {
+    char *dbPath;           /* canonical database path (owned) */
+    char *socketPath;       /* per-db socket override (owned, may be NULL) */
+    int syncOnCommit;       /* 1 = next WAL sync triggers replication */
+} LitestreamDBState;
+
+static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
+static LitestreamDBState g_dbs[LS_MAX_DBS];
+static int g_dbCount = 0;
+
 /* Global default socket path, set at init time. */
 static const char *g_socketPath = NULL;
 
-/* Forward declarations */
-static int lsOpen(sqlite3_vfs*, const char*, sqlite3_file*, int, int*);
+/* The original VFS we're wrapping */
+static sqlite3_vfs *g_pOrigVfs = NULL;
 
 /*
-** Per-file state. Must have sqlite3_file as first member.
+** Find or create shared state for a database path.
+** Caller must hold g_mu.
 */
+static LitestreamDBState *findOrCreateDBStateLocked(const char *dbPath) {
+    int i;
+    if (dbPath == NULL) return NULL;
+
+    for (i = 0; i < g_dbCount; i++) {
+        if (strcmp(g_dbs[i].dbPath, dbPath) == 0) {
+            return &g_dbs[i];
+        }
+    }
+
+    if (g_dbCount >= LS_MAX_DBS) return NULL;
+
+    g_dbs[g_dbCount].dbPath = sqlite3_mprintf("%s", dbPath);
+    g_dbs[g_dbCount].socketPath = NULL;
+    g_dbs[g_dbCount].syncOnCommit = 0;
+    return &g_dbs[g_dbCount++];
+}
+
+static int getSyncFlag(const char *dbPath) {
+    int val = 0;
+    int i;
+    pthread_mutex_lock(&g_mu);
+    for (i = 0; i < g_dbCount; i++) {
+        if (strcmp(g_dbs[i].dbPath, dbPath) == 0) {
+            val = g_dbs[i].syncOnCommit;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_mu);
+    return val;
+}
+
+static void setSyncFlag(const char *dbPath, int val) {
+    LitestreamDBState *st;
+    pthread_mutex_lock(&g_mu);
+    st = findOrCreateDBStateLocked(dbPath);
+    if (st) st->syncOnCommit = val;
+    pthread_mutex_unlock(&g_mu);
+}
+
+static const char *getSocketPath(const char *dbPath) {
+    const char *path = NULL;
+    int i;
+    pthread_mutex_lock(&g_mu);
+    for (i = 0; i < g_dbCount; i++) {
+        if (strcmp(g_dbs[i].dbPath, dbPath) == 0) {
+            path = g_dbs[i].socketPath;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_mu);
+    return path ? path : g_socketPath;
+}
+
+static void setSocketPath(const char *dbPath, const char *socketPath) {
+    LitestreamDBState *st;
+    pthread_mutex_lock(&g_mu);
+    st = findOrCreateDBStateLocked(dbPath);
+    if (st) {
+        if (st->socketPath) sqlite3_free(st->socketPath);
+        st->socketPath = sqlite3_mprintf("%s", socketPath);
+    }
+    pthread_mutex_unlock(&g_mu);
+}
+
+/* ---- Per-file state ---- */
+
 typedef struct LitestreamFile {
     sqlite3_file base;          /* Must be first (SQLite convention) */
     sqlite3_file *pReal;        /* Real underlying file */
-    sqlite3_vfs *pRealVfs;      /* Real underlying VFS */
     int isWAL;                  /* 1 if this file handle is the WAL file */
-    int syncOnCommit;           /* Set by PRAGMA litestream_sync */
-    char *socketPath;           /* Path to litestream Unix socket (owned) */
-    char *dbPath;               /* Database path for IPC request (owned) */
+    char *dbPath;               /* Database path — key into g_dbs (owned) */
 } LitestreamFile;
+
+/* Forward declarations */
+static int lsOpen(sqlite3_vfs*, const char*, sqlite3_file*, int, int*);
 
 /* Wrapped io_methods forward declarations */
 static int lsClose(sqlite3_file*);
@@ -127,12 +221,9 @@ static sqlite3_io_methods ls_io_methods_v3 = {
     lsUnfetch
 };
 
-/* The original VFS we're wrapping */
-static sqlite3_vfs *g_pOrigVfs = NULL;
-
 /*
 ** Derive the database path from a WAL path by stripping the "-wal" suffix.
-** Returns a newly allocated string that the caller must free.
+** Returns a newly allocated string that the caller must free with sqlite3_free.
 */
 static char *derive_db_path(const char *zWalPath) {
     size_t n;
@@ -217,6 +308,7 @@ static int lsOpen(sqlite3_vfs *pVfs, const char *zName,
                   sqlite3_file *pFile, int flags, int *pOutFlags) {
     LitestreamFile *p = (LitestreamFile *)pFile;
     int rc;
+    (void)pVfs;
 
     memset(p, 0, sizeof(*p));
 
@@ -224,7 +316,6 @@ static int lsOpen(sqlite3_vfs *pVfs, const char *zName,
     p->pReal = (sqlite3_file *)sqlite3_malloc(g_pOrigVfs->szOsFile);
     if (p->pReal == NULL) return SQLITE_NOMEM;
     memset(p->pReal, 0, g_pOrigVfs->szOsFile);
-    p->pRealVfs = g_pOrigVfs;
 
     rc = g_pOrigVfs->xOpen(g_pOrigVfs, zName, p->pReal, flags, pOutFlags);
     if (rc != SQLITE_OK) {
@@ -236,14 +327,12 @@ static int lsOpen(sqlite3_vfs *pVfs, const char *zName,
     /* Tag WAL files for xSync interception */
     p->isWAL = (flags & SQLITE_OPEN_WAL) ? 1 : 0;
 
-    /* Extract DB path from WAL path (strip "-wal" suffix) */
+    /* Set dbPath for both main database files and WAL files so they
+    ** share state through the global g_dbs table. */
     if (p->isWAL && zName != NULL) {
-        p->dbPath = derive_db_path(zName);
-    }
-
-    /* Set default socket path */
-    if (g_socketPath != NULL) {
-        p->socketPath = sqlite3_mprintf("%s", g_socketPath);
+        p->dbPath = derive_db_path(zName);  /* strip "-wal" suffix */
+    } else if ((flags & SQLITE_OPEN_MAIN_DB) && zName != NULL) {
+        p->dbPath = sqlite3_mprintf("%s", zName);
     }
 
     /* Use the io_methods version that matches the real file */
@@ -257,50 +346,62 @@ static int lsOpen(sqlite3_vfs *pVfs, const char *zName,
 }
 
 static int lsDelete(sqlite3_vfs *pVfs, const char *zName, int syncDir) {
+    (void)pVfs;
     return g_pOrigVfs->xDelete(g_pOrigVfs, zName, syncDir);
 }
 
 static int lsAccess(sqlite3_vfs *pVfs, const char *zName, int flags, int *pResOut) {
+    (void)pVfs;
     return g_pOrigVfs->xAccess(g_pOrigVfs, zName, flags, pResOut);
 }
 
 static int lsFullPathname(sqlite3_vfs *pVfs, const char *zName, int nOut, char *zOut) {
+    (void)pVfs;
     return g_pOrigVfs->xFullPathname(g_pOrigVfs, zName, nOut, zOut);
 }
 
 static void *lsDlOpen(sqlite3_vfs *pVfs, const char *zFilename) {
+    (void)pVfs;
     return g_pOrigVfs->xDlOpen(g_pOrigVfs, zFilename);
 }
 
 static void lsDlError(sqlite3_vfs *pVfs, int nByte, char *zErrMsg) {
+    (void)pVfs;
     g_pOrigVfs->xDlError(g_pOrigVfs, nByte, zErrMsg);
 }
 
 static void (*lsDlSym(sqlite3_vfs *pVfs, void *p, const char *zSymbol))(void) {
+    (void)pVfs;
     return g_pOrigVfs->xDlSym(g_pOrigVfs, p, zSymbol);
 }
 
 static void lsDlClose(sqlite3_vfs *pVfs, void *p) {
+    (void)pVfs;
     g_pOrigVfs->xDlClose(g_pOrigVfs, p);
 }
 
 static int lsRandomness(sqlite3_vfs *pVfs, int nByte, char *zOut) {
+    (void)pVfs;
     return g_pOrigVfs->xRandomness(g_pOrigVfs, nByte, zOut);
 }
 
 static int lsSleep(sqlite3_vfs *pVfs, int microseconds) {
+    (void)pVfs;
     return g_pOrigVfs->xSleep(g_pOrigVfs, microseconds);
 }
 
 static int lsCurrentTime(sqlite3_vfs *pVfs, double *pTimeOut) {
+    (void)pVfs;
     return g_pOrigVfs->xCurrentTime(g_pOrigVfs, pTimeOut);
 }
 
 static int lsGetLastError(sqlite3_vfs *pVfs, int nByte, char *zOut) {
+    (void)pVfs;
     return g_pOrigVfs->xGetLastError(g_pOrigVfs, nByte, zOut);
 }
 
 static int lsCurrentTimeInt64(sqlite3_vfs *pVfs, sqlite3_int64 *pTimeOut) {
+    (void)pVfs;
     return g_pOrigVfs->xCurrentTimeInt64(g_pOrigVfs, pTimeOut);
 }
 
@@ -313,10 +414,8 @@ static int lsClose(sqlite3_file *pFile) {
         rc = p->pReal->pMethods->xClose(p->pReal);
     }
     if (p->pReal) sqlite3_free(p->pReal);
-    if (p->socketPath) sqlite3_free(p->socketPath);
     if (p->dbPath) sqlite3_free(p->dbPath);
     p->pReal = NULL;
-    p->socketPath = NULL;
     p->dbPath = NULL;
     return rc;
 }
@@ -338,24 +437,29 @@ static int lsTruncate(sqlite3_file *pFile, sqlite3_int64 size) {
 
 static int lsSync(sqlite3_file *pFile, int flags) {
     LitestreamFile *p = (LitestreamFile *)pFile;
+    int rc;
+    const char *sock;
 
     /* Pass through for non-WAL files or when sync not requested */
-    if (!p->isWAL || !p->syncOnCommit) {
+    if (!p->isWAL || !p->dbPath || !getSyncFlag(p->dbPath)) {
         return p->pReal->pMethods->xSync(p->pReal, flags);
     }
 
+    /* Look up per-db socket path (falls back to global default) */
+    sock = getSocketPath(p->dbPath);
+
     /* 1. POST to litestream socket: /sync-replicate */
-    if (ipc_sync_replicate(p->socketPath, p->dbPath) != 0) {
+    if (ipc_sync_replicate(sock, p->dbPath) != 0) {
         /* S3 upload failed — return error so SQLite rolls back */
-        p->syncOnCommit = 0;
+        setSyncFlag(p->dbPath, 0);
         return SQLITE_IOERR;
     }
 
     /* 2. S3 succeeded, now do local fsync */
-    int rc = p->pReal->pMethods->xSync(p->pReal, flags);
+    rc = p->pReal->pMethods->xSync(p->pReal, flags);
 
     /* 3. Auto-reset the flag */
-    p->syncOnCommit = 0;
+    setSyncFlag(p->dbPath, 0);
 
     return rc;
 }
@@ -383,31 +487,30 @@ static int lsCheckReservedLock(sqlite3_file *pFile, int *pResOut) {
 static int lsFileControl(sqlite3_file *pFile, int op, void *pArg) {
     LitestreamFile *p = (LitestreamFile *)pFile;
 
-    if (op == SQLITE_FCNTL_PRAGMA) {
+    if (op == SQLITE_FCNTL_PRAGMA && p->dbPath) {
         char **azArg = (char **)pArg;
         /* azArg[1] = pragma name, azArg[2] = value (or NULL for read) */
 
         if (azArg[1] && strcmp(azArg[1], "litestream_sync") == 0) {
             if (azArg[2] == NULL) {
-                /* Read: return current value */
-                azArg[0] = sqlite3_mprintf("%d", p->syncOnCommit);
+                /* Read: return current value from shared state */
+                azArg[0] = sqlite3_mprintf("%d", getSyncFlag(p->dbPath));
                 return SQLITE_OK;
             }
-            /* Write: set flag */
-            p->syncOnCommit = atoi(azArg[2]);
+            /* Write: set flag in shared state */
+            setSyncFlag(p->dbPath, atoi(azArg[2]));
             return SQLITE_OK;
         }
 
         if (azArg[1] && strcmp(azArg[1], "litestream_socket") == 0) {
             if (azArg[2] == NULL) {
-                /* Read: return current value */
-                azArg[0] = sqlite3_mprintf("%s",
-                    p->socketPath ? p->socketPath : "(default)");
+                /* Read: return current value from shared state */
+                const char *sock = getSocketPath(p->dbPath);
+                azArg[0] = sqlite3_mprintf("%s", sock ? sock : "(default)");
                 return SQLITE_OK;
             }
-            /* Write: set socket path */
-            if (p->socketPath) sqlite3_free(p->socketPath);
-            p->socketPath = sqlite3_mprintf("%s", azArg[2]);
+            /* Write: set socket path in shared state */
+            setSocketPath(p->dbPath, azArg[2]);
             return SQLITE_OK;
         }
     }
@@ -468,6 +571,7 @@ int sqlite3_litestreamSync_init(
     const sqlite3_api_routines *pApi
 ) {
     static sqlite3_vfs lsVfs;
+    (void)db;
 
     SQLITE_EXTENSION_INIT2(pApi);
 
@@ -509,6 +613,9 @@ int sqlite3_litestreamSync_init(
     lsVfs.xGetLastError   = lsGetLastError;
     lsVfs.xCurrentTimeInt64 = lsCurrentTimeInt64;
 
-    /* Register as non-default (applications opt-in with PRAGMA or URI) */
-    return sqlite3_vfs_register(&lsVfs, 0);
+    /* Register as default VFS. The shim is a transparent passthrough when
+    ** syncOnCommit is 0, so there is no overhead for normal operations.
+    ** Being default means all new connections automatically use the shim
+    ** without requiring URI parameters or special connection setup. */
+    return sqlite3_vfs_register(&lsVfs, 1);
 }
